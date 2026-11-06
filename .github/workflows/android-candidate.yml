@@ -1,0 +1,100 @@
+name: Build pinned Halo Android candidate
+
+# Only user-triggered, one Android job, never any release or deployment.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character SHA in PhishyOne/Halo-OpenCE-Android
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: halo-android-candidate
+  cancel-in-progress: false
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Validate SHA and fetch exact public source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Expected a full lowercase commit SHA'; exit 1
+          fi
+          mkdir game
+          cd game
+          git init -q
+          git remote add origin https://github.com/PhishyOne/Halo-OpenCE-Android.git
+          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git status --porcelain
+          echo "Verified exact source commit: $SOURCE_SHA"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Run asset-free LAN configuration checks
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lan-tests"
+          javac -proc:none -d "$RUNNER_TEMP/lan-tests" \
+            game/port/android/app/src/main/java/com/halo/decomp/LanConfig.java \
+            game/tools/lan/LanConfigSmokeTest.java
+          java -cp "$RUNNER_TEMP/lan-tests" com.halo.decomp.LanConfigSmokeTest
+
+      - name: Install pinned Android tools
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fLsS --retry 2 -o "$RUNNER_TEMP/ninja.zip" \
+            https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-linux.zip
+          echo "6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255  $RUNNER_TEMP/ninja.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/ninja.zip" -d "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-35" "build-tools;35.0.0" \
+            "ndk;27.2.12479018" "cmake;3.22.1"
+          echo "$ANDROID_HOME/cmake/3.22.1/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Compile native Android build
+        working-directory: game
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          python3 configure.py --release --pgo=off --lto=off \
+            --android-ndk "$NDK" \
+            --android-guest-cc "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          ninja android_apk
+          test -s port/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Verify APK and record SHA-256
+        run: |
+          set -euo pipefail
+          APK=game/port/android/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -m1 "package: name='com.halo.decomp'"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          unzip -Z1 "$APK" | grep -Fx 'lib/arm64-v8a/libmain.so'
+          sha256sum "$APK" | tee game/apk-sha256.txt
+          git -C game rev-parse HEAD > game/source-sha.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: halo-lan-android-${{ github.run_id }}
+          path: |
+            game/port/android/app/build/outputs/apk/debug/app-debug.apk
+            game/apk-sha256.txt
+            game/source-sha.txt
+          retention-days: 7
+          if-no-files-found: error
