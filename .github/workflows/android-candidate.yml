@@ -1,0 +1,134 @@
+name: Build pinned Halo Android candidate
+
+# Only manual dispatch on this builder's default branch, one Android job.
+# The source fork's Actions remain disabled; this job cannot publish or deploy.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character SHA in PhishyOne/Halo-OpenCE-Android
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: halo-android-candidate
+  cancel-in-progress: false
+
+jobs:
+  android:
+    if: github.repository == 'PhishyOne/Halo-OpenCE-Builder' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Verify builder identity and public source repository
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'PhishyOne/Halo-OpenCE-Builder'
+          test "$GITHUB_REPOSITORY_ID" = '1447774948'
+          test "$GITHUB_EVENT_NAME" = 'workflow_dispatch'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Expected a full lowercase 40-character source SHA'; exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import urllib.request
+          request = urllib.request.Request(
+              'https://api.github.com/repos/PhishyOne/Halo-OpenCE-Android',
+              headers={'User-Agent': 'halo-public-android-builder'})
+          with urllib.request.urlopen(request, timeout=20) as response:
+              info = json.load(response)
+          assert info['id'] == 1447543894, 'source repository identity changed'
+          assert info['full_name'] == 'PhishyOne/Halo-OpenCE-Android'
+          assert info['private'] is False and info['archived'] is False
+          assert info['parent']['id'] == 1388653148, 'unexpected upstream parent'
+          print('Validated public source identity')
+          PY
+
+      - name: Fetch exact source commit
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mkdir game
+          cd game
+          git init -q
+          git remote add origin https://github.com/PhishyOne/Halo-OpenCE-Android.git
+          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+          echo "Verified source commit: $SOURCE_SHA"
+
+      # Immutable tag v4.7.1, verified from actions/setup-java repository.
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Run asset-free LAN configuration checks
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lan-tests"
+          javac -proc:none -d "$RUNNER_TEMP/lan-tests" \
+            game/port/android/app/src/main/java/com/halo/decomp/LanConfig.java \
+            game/tools/lan/LanConfigSmokeTest.java
+          java -cp "$RUNNER_TEMP/lan-tests" com.halo.decomp.LanConfigSmokeTest
+
+      - name: Install pinned Android tools
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fLsS --retry 2 -o "$RUNNER_TEMP/ninja.zip" \
+            https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-linux.zip
+          echo "6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255  $RUNNER_TEMP/ninja.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/ninja.zip" -d "$RUNNER_TEMP/bin"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-35" "build-tools;35.0.0" "build-tools;36.0.0" \
+            "ndk;27.2.12479018" "cmake;3.22.1"
+          # GitHub PATH entries are prepended; verified Ninja must come last.
+          echo "$ANDROID_HOME/cmake/3.22.1/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Compile native Android build
+        working-directory: game
+        run: |
+          set -euo pipefail
+          test "$(ninja --version)" = '1.12.1'
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          python3 configure.py --release --pgo=off --lto=off \
+            --android-ndk "$NDK" \
+            --android-guest-cc "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          ninja android_apk
+          test -s port/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Verify APK and record SHA-256
+        run: |
+          set -euo pipefail
+          APK=game/port/android/app/build/outputs/apk/debug/app-debug.apk
+          BADGING="$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK")"
+          PACKAGE_LINE="${BADGING%%$'\n'*}"
+          PREFIX="package: name='com.halo.decomp' "
+          if [[ "$PACKAGE_LINE" != "$PREFIX"* ]]; then
+            echo "Unexpected APK applicationId: $PACKAGE_LINE"; exit 1
+          fi
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          unzip -Z1 "$APK" | grep -Fx 'lib/arm64-v8a/libmain.so'
+          sha256sum "$APK" | tee game/apk-sha256.txt
+          git -C game rev-parse HEAD > game/source-sha.txt
+
+      # Immutable tag v4.6.2, verified from actions/upload-artifact repository.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: halo-lan-android-${{ github.run_id }}
+          path: |
+            game/port/android/app/build/outputs/apk/debug/app-debug.apk
+            game/apk-sha256.txt
+            game/source-sha.txt
+          retention-days: 7
+          if-no-files-found: error
