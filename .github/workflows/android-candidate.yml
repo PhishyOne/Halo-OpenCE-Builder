@@ -97,7 +97,11 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y gcc-multilib
             fi
-            "$RUNNER_TEMP/bot-tests/bin/python" -m pytest -q tools/harness/tests/test_bots_lobby.py
+            checks=(tools/harness/tests/test_bots_lobby.py)
+            if [[ -f tools/harness/tests/test_bot_action_relay.py ]]; then
+              checks+=(tools/harness/tests/test_bot_action_relay.py)
+            fi
+            "$RUNNER_TEMP/bot-tests/bin/python" -m pytest -q "${checks[@]}"
           else
             echo 'Bot harness not present on this source revision.'
           fi
