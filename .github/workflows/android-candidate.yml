@@ -26,6 +26,8 @@ jobs:
       - name: Verify builder identity and public source repository
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          # Read-only workflow token, scoped to this identity step only.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'PhishyOne/Halo-OpenCE-Builder'
@@ -37,10 +39,18 @@ jobs:
           fi
           python3 - <<'PY'
           import json
+          import os
           import urllib.request
+          # Authenticate the public metadata request: unauthenticated runner
+          # IPs can hit GitHub's shared rate limit. Do not grant the source
+          # checkout or build process access to this token.
+          token = os.environ['GH_TOKEN']
+          assert token, 'missing read-only identity token'
           request = urllib.request.Request(
               'https://api.github.com/repos/PhishyOne/Halo-OpenCE-Android',
-              headers={'User-Agent': 'halo-public-android-builder'})
+              headers={'User-Agent': 'halo-public-android-builder',
+                       'Accept': 'application/vnd.github+json',
+                       'Authorization': 'Bearer ' + token})
           with urllib.request.urlopen(request, timeout=20) as response:
               info = json.load(response)
           assert info['id'] == 1447543894, 'source repository identity changed'
