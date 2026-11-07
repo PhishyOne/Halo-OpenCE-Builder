@@ -90,7 +90,14 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -f tools/harness/tests/test_bots_lobby.py ]]; then
-            python3 -m pytest -q tools/harness/tests/test_bots_lobby.py
+            python3 -m venv "$RUNNER_TEMP/bot-tests"
+            "$RUNNER_TEMP/bot-tests/bin/python" -m pip install --disable-pip-version-check "pytest==9.2.0"
+            if ! printf '#include <stdio.h>\nint main(void) { return 0; }\n' |
+                 clang -m32 -x c - -o "$RUNNER_TEMP/bot-tests/cc-check"; then
+              sudo apt-get update
+              sudo apt-get install -y gcc-multilib
+            fi
+            "$RUNNER_TEMP/bot-tests/bin/python" -m pytest -q tools/harness/tests/test_bots_lobby.py
           else
             echo 'Bot harness not present on this source revision.'
           fi
